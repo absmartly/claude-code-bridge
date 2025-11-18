@@ -130,6 +130,11 @@ function spawnClaudeForConversation(conversationId, systemPrompt, sessionId, isR
   args.push('--tools', JSON.stringify([DOM_CHANGES_TOOL]))
   args.push('--tool-choice', JSON.stringify({ type: 'tool', name: 'dom_changes_generator' }))
 
+  console.log(`[${conversationId}] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`)
+  console.log(`[${conversationId}] 🚀 SPAWNING CLAUDE CLI WITH ARGUMENTS:`)
+  console.log(`[${conversationId}] Command: npx ${args.join(' ')}`)
+  console.log(`[${conversationId}] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`)
+
   const claudeProcess = spawn('npx', args, {
     stdio: ['pipe', 'pipe', 'pipe']
   })
@@ -147,17 +152,23 @@ function spawnClaudeForConversation(conversationId, systemPrompt, sessionId, isR
 
       try {
         const event = JSON.parse(line)
-        console.log(`[${conversationId}] Claude event:`, JSON.stringify(event).substring(0, 300))
+        console.log(`[${conversationId}] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`)
+        console.log(`[${conversationId}] 📦 RAW EVENT FROM CLAUDE CLI:`)
+        console.log(JSON.stringify(event, null, 2))
+        console.log(`[${conversationId}] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`)
 
         const res = activeStreams.get(conversationId)
         if (res) {
           if (event.type === 'assistant' && event.message?.content) {
+            console.log(`[${conversationId}] Processing assistant message with ${event.message.content.length} content blocks`)
             for (const block of event.message.content) {
+              console.log(`[${conversationId}] Content block type: ${block.type}`)
               if (block.type === 'text' && block.text) {
                 res.write(`data: ${JSON.stringify({ type: 'text', data: block.text })}\n\n`)
               } else if (block.type === 'tool_use' && block.input) {
                 // Handle structured tool response
-                console.log(`[${conversationId}] Received tool_use response:`, JSON.stringify(block.input).substring(0, 200))
+                console.log(`[${conversationId}] ✅ Found tool_use block, forwarding to client`)
+                console.log(`[${conversationId}] Tool input:`, JSON.stringify(block.input, null, 2))
                 const toolInput = block.input
                 // Send the tool input as structured JSON to the client
                 res.write(`data: ${JSON.stringify({ type: 'tool_use', data: toolInput })}\n\n`)
@@ -165,6 +176,8 @@ function spawnClaudeForConversation(conversationId, systemPrompt, sessionId, isR
                 if (toolInput.response) {
                   res.write(`data: ${JSON.stringify({ type: 'text', data: toolInput.response })}\n\n`)
                 }
+              } else {
+                console.log(`[${conversationId}] ⚠️ Unknown or unhandled content block type:`, block.type)
               }
             }
           } else if (event.type === 'result') {
