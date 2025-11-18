@@ -12,12 +12,13 @@ const PORT = process.env.PORT ? parseInt(process.env.PORT) : null
 
 const app = express()
 app.use(cors())
-app.use(express.json())
+app.use(express.json({ limit: '10mb' }))
 
 const claudeProcesses = new Map()
 const activeStreams = new Map()
 const conversationMessages = new Map()
 const sessionTracking = new Map()
+const outputBuffers = new Map()
 
 function checkClaudeAuth() {
   try {
@@ -62,6 +63,36 @@ function checkClaudeAuth() {
   }
 }
 
+// Tool definition for DOM changes generation
+const DOM_CHANGES_TOOL = {
+  name: 'dom_changes_generator',
+  description: 'Generates DOM change objects for A/B tests following strict selector rules.',
+  input_schema: {
+    type: 'object',
+    properties: {
+      domChanges: {
+        type: 'array',
+        description: 'Array of DOM change instruction objects.'
+      },
+      response: {
+        type: 'string',
+        description: 'Conversational explanation and reasoning.'
+      },
+      action: {
+        type: 'string',
+        enum: ['append', 'replace_all', 'replace_specific', 'remove_specific', 'none'],
+        description: 'How the DOM changes should be applied.'
+      },
+      targetSelectors: {
+        type: 'array',
+        description: 'Selectors to target for replace/remove actions.',
+        items: { type: 'string' }
+      }
+    },
+    required: ['domChanges', 'response', 'action']
+  }
+}
+
 function spawnClaudeForConversation(conversationId, systemPrompt, sessionId, isResume = false) {
   if (claudeProcesses.has(conversationId)) {
     console.log(`Claude CLI already running for conversation ${conversationId}`)
@@ -94,14 +125,27 @@ function spawnClaudeForConversation(conversationId, systemPrompt, sessionId, isR
     args.push('--system-prompt', systemPrompt)
   }
 
+  // Add tool support for structured output
+  console.log(`Adding DOM changes generator tool for conversation ${conversationId}`)
+  args.push('--tools', JSON.stringify([DOM_CHANGES_TOOL]))
+  args.push('--tool-choice', JSON.stringify({ type: 'tool', name: 'dom_changes_generator' }))
+
   const claudeProcess = spawn('npx', args, {
     stdio: ['pipe', 'pipe', 'pipe']
   })
 
   claudeProcess.stdout.on('data', (data) => {
-    try {
-      const lines = data.toString().split('\n').filter(l => l.trim())
-      for (const line of lines) {
+    let buffer = outputBuffers.get(conversationId) || ''
+    buffer += data.toString()
+
+    const lines = buffer.split('\n')
+    buffer = lines.pop()
+    outputBuffers.set(conversationId, buffer)
+
+    for (const line of lines) {
+      if (!line.trim()) continue
+
+      try {
         const event = JSON.parse(line)
         console.log(`[${conversationId}] Claude event:`, JSON.stringify(event).substring(0, 300))
 
@@ -111,26 +155,62 @@ function spawnClaudeForConversation(conversationId, systemPrompt, sessionId, isR
             for (const block of event.message.content) {
               if (block.type === 'text' && block.text) {
                 res.write(`data: ${JSON.stringify({ type: 'text', data: block.text })}\n\n`)
+              } else if (block.type === 'tool_use' && block.input) {
+                // Handle structured tool response
+                console.log(`[${conversationId}] Received tool_use response:`, JSON.stringify(block.input).substring(0, 200))
+                const toolInput = block.input
+                // Send the tool input as structured JSON to the client
+                res.write(`data: ${JSON.stringify({ type: 'tool_use', data: toolInput })}\n\n`)
+                // Also send the response text for display
+                if (toolInput.response) {
+                  res.write(`data: ${JSON.stringify({ type: 'text', data: toolInput.response })}\n\n`)
+                }
               }
             }
           } else if (event.type === 'result') {
-            if (event.result) {
-              res.write(`data: ${JSON.stringify({ type: 'text', data: event.result })}\n\n`)
+            let resultText = event.result
+            if (typeof resultText === 'string') {
+              try {
+                const parsed = JSON.parse(resultText)
+                if (parsed.response) {
+                  resultText = parsed.response
+                }
+              } catch (e) {
+                console.log(`[${conversationId}] Result is not JSON, using as-is`)
+              }
+            }
+
+            if (resultText) {
+              res.write(`data: ${JSON.stringify({ type: 'text', data: resultText })}\n\n`)
             }
             res.write(`data: ${JSON.stringify({ type: 'done' })}\n\n`)
             res.end()
             activeStreams.delete(conversationId)
+            outputBuffers.delete(conversationId)
           } else if (event.type === 'error') {
             res.write(`data: ${JSON.stringify({ type: 'error', data: event.error || 'Unknown error' })}\n\n`)
             res.end()
             activeStreams.delete(conversationId)
+            outputBuffers.delete(conversationId)
           } else {
             res.write(`data: ${JSON.stringify(event)}\n\n`)
           }
         }
+      } catch (err) {
+        console.error(`[${conversationId}] Failed to parse Claude output:`, err.message, 'Raw:', line.substring(0, 200))
+
+        const res = activeStreams.get(conversationId)
+        if (res) {
+          res.write(`data: ${JSON.stringify({
+            type: 'text',
+            data: 'Response generated but encountered parsing error. Check server logs for details.'
+          })}\n\n`)
+          res.write(`data: ${JSON.stringify({ type: 'done' })}\n\n`)
+          res.end()
+          activeStreams.delete(conversationId)
+          outputBuffers.delete(conversationId)
+        }
       }
-    } catch (err) {
-      console.error(`[${conversationId}] Failed to parse Claude output:`, err.message, 'Raw:', data.toString().substring(0, 200))
     }
   })
 
@@ -141,6 +221,7 @@ function spawnClaudeForConversation(conversationId, systemPrompt, sessionId, isR
   claudeProcess.on('exit', (code) => {
     console.log(`[${conversationId}] Claude CLI exited with code ${code}`)
     claudeProcesses.delete(conversationId)
+    outputBuffers.delete(conversationId)
     const res = activeStreams.get(conversationId)
     if (res) {
       res.end()
