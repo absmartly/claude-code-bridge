@@ -181,21 +181,9 @@ function spawnClaudeForConversation(conversationId, systemPrompt, sessionId, isR
               }
             }
           } else if (event.type === 'result') {
-            let resultText = event.result
-            if (typeof resultText === 'string') {
-              try {
-                const parsed = JSON.parse(resultText)
-                if (parsed.response) {
-                  resultText = parsed.response
-                }
-              } catch (e) {
-                console.log(`[${conversationId}] Result is not JSON, using as-is`)
-              }
-            }
-
-            if (resultText) {
-              res.write(`data: ${JSON.stringify({ type: 'text', data: resultText })}\n\n`)
-            }
+            console.log(`[${conversationId}] Received result event - sending done`)
+            // Don't send result as text - we already sent the assistant message content
+            // Just signal that we're done
             res.write(`data: ${JSON.stringify({ type: 'done' })}\n\n`)
             res.end()
             activeStreams.delete(conversationId)
