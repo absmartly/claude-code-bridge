@@ -63,34 +63,30 @@ function checkClaudeAuth() {
   }
 }
 
-// Tool definition for DOM changes generation
-const DOM_CHANGES_TOOL = {
-  name: 'dom_changes_generator',
-  description: 'Generates DOM change objects for A/B tests following strict selector rules.',
-  input_schema: {
-    type: 'object',
-    properties: {
-      domChanges: {
-        type: 'array',
-        description: 'Array of DOM change instruction objects.'
-      },
-      response: {
-        type: 'string',
-        description: 'Conversational explanation and reasoning.'
-      },
-      action: {
-        type: 'string',
-        enum: ['append', 'replace_all', 'replace_specific', 'remove_specific', 'none'],
-        description: 'How the DOM changes should be applied.'
-      },
-      targetSelectors: {
-        type: 'array',
-        description: 'Selectors to target for replace/remove actions.',
-        items: { type: 'string' }
-      }
+// JSON schema for structured DOM changes output
+const DOM_CHANGES_SCHEMA = {
+  type: 'object',
+  properties: {
+    domChanges: {
+      type: 'array',
+      description: 'Array of DOM change instruction objects.'
     },
-    required: ['domChanges', 'response', 'action']
-  }
+    response: {
+      type: 'string',
+      description: 'Conversational explanation and reasoning.'
+    },
+    action: {
+      type: 'string',
+      enum: ['append', 'replace_all', 'replace_specific', 'remove_specific', 'none'],
+      description: 'How the DOM changes should be applied.'
+    },
+    targetSelectors: {
+      type: 'array',
+      description: 'Selectors to target for replace/remove actions.',
+      items: { type: 'string' }
+    }
+  },
+  required: ['domChanges', 'response', 'action']
 }
 
 function spawnClaudeForConversation(conversationId, systemPrompt, sessionId, isResume = false) {
@@ -107,7 +103,9 @@ function spawnClaudeForConversation(conversationId, systemPrompt, sessionId, isR
     '--output-format', 'stream-json',
     '--input-format', 'stream-json',
     '--replay-user-messages',
-    '--dangerously-skip-permissions'
+    '--permission-mode', 'plan',
+    '--tools', '',
+    '--settings', JSON.stringify({ disableClaudeMd: true })
   ]
 
   if (sessionId) {
@@ -125,14 +123,14 @@ function spawnClaudeForConversation(conversationId, systemPrompt, sessionId, isR
     args.push('--system-prompt', systemPrompt)
   }
 
-  // Add tool support for structured output
-  console.log(`Adding DOM changes generator tool for conversation ${conversationId}`)
-  args.push('--tools', JSON.stringify([DOM_CHANGES_TOOL]))
-  args.push('--tool-choice', JSON.stringify({ type: 'tool', name: 'dom_changes_generator' }))
+  // Add JSON schema for structured output
+  console.log(`Adding JSON schema for structured DOM changes output`)
+  args.push('--json-schema', JSON.stringify(DOM_CHANGES_SCHEMA))
 
   console.log(`[${conversationId}] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`)
   console.log(`[${conversationId}] 🚀 SPAWNING CLAUDE CLI WITH ARGUMENTS:`)
   console.log(`[${conversationId}] Command: npx ${args.join(' ')}`)
+  console.log(`[${conversationId}] Using --json-schema for structured output`)
   console.log(`[${conversationId}] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`)
 
   const claudeProcess = spawn('npx', args, {
@@ -164,15 +162,33 @@ function spawnClaudeForConversation(conversationId, systemPrompt, sessionId, isR
             for (const block of event.message.content) {
               console.log(`[${conversationId}] Content block type: ${block.type}`)
               if (block.type === 'text' && block.text) {
-                res.write(`data: ${JSON.stringify({ type: 'text', data: block.text })}\n\n`)
+                // Try to parse as JSON schema response
+                try {
+                  const parsedJson = JSON.parse(block.text.trim())
+                  // Check if it matches our schema (has required fields)
+                  if (parsedJson.domChanges && parsedJson.response && parsedJson.action) {
+                    console.log(`[${conversationId}] ✅ Parsed JSON schema response, forwarding as structured data`)
+                    console.log(`[${conversationId}] Structured data:`, JSON.stringify(parsedJson, null, 2))
+                    // Send as tool_use-style event for compatibility
+                    res.write(`data: ${JSON.stringify({ type: 'tool_use', data: parsedJson })}\n\n`)
+                    // Also send the response text for display
+                    if (parsedJson.response) {
+                      res.write(`data: ${JSON.stringify({ type: 'text', data: parsedJson.response })}\n\n`)
+                    }
+                  } else {
+                    // Not our schema format, send as regular text
+                    res.write(`data: ${JSON.stringify({ type: 'text', data: block.text })}\n\n`)
+                  }
+                } catch (e) {
+                  // Not JSON, send as regular text
+                  res.write(`data: ${JSON.stringify({ type: 'text', data: block.text })}\n\n`)
+                }
               } else if (block.type === 'tool_use' && block.input) {
-                // Handle structured tool response
+                // Handle tool_use blocks (shouldn't happen with --json-schema, but keep for safety)
                 console.log(`[${conversationId}] ✅ Found tool_use block, forwarding to client`)
                 console.log(`[${conversationId}] Tool input:`, JSON.stringify(block.input, null, 2))
                 const toolInput = block.input
-                // Send the tool input as structured JSON to the client
                 res.write(`data: ${JSON.stringify({ type: 'tool_use', data: toolInput })}\n\n`)
-                // Also send the response text for display
                 if (toolInput.response) {
                   res.write(`data: ${JSON.stringify({ type: 'text', data: toolInput.response })}\n\n`)
                 }
