@@ -27,5 +27,16 @@
   },
   "engines": {
     "node": ">=16.0.0"
-  }
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/absmartly/claude-code-bridge.git"
+  },
+  "bugs": {
+    "url": "https://github.com/absmartly/claude-code-bridge/issues"
+  },
+  "homepage": "https://github.com/absmartly/claude-code-bridge#readme"
 }
