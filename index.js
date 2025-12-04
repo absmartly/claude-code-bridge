@@ -23,37 +23,58 @@ const outputBuffers = new Map()
 function checkClaudeAuth() {
   try {
     const credentialsPath = path.join(os.homedir(), '.claude', '.credentials.json')
+    const claudeDir = path.join(os.homedir(), '.claude')
 
-    if (!fs.existsSync(credentialsPath)) {
+    if (fs.existsSync(credentialsPath)) {
+      const credentials = JSON.parse(fs.readFileSync(credentialsPath, 'utf8'))
+
+      if (!credentials.claudeAiOauth) {
+        return {
+          authenticated: false,
+          error: 'No Claude OAuth credentials found'
+        }
+      }
+
+      const { expiresAt, subscriptionType } = credentials.claudeAiOauth
+      const isExpired = new Date(expiresAt) < new Date()
+
+      if (isExpired) {
+        return {
+          authenticated: false,
+          error: `Claude credentials expired at: ${expiresAt}`
+        }
+      }
+
       return {
-        authenticated: false,
-        error: 'Claude CLI not logged in. Run: npx @anthropic-ai/claude-code login'
+        authenticated: true,
+        subscriptionType,
+        expiresAt,
+        method: 'credentials file'
       }
     }
 
-    const credentials = JSON.parse(fs.readFileSync(credentialsPath, 'utf8'))
+    if (fs.existsSync(claudeDir)) {
+      const historyPath = path.join(claudeDir, 'history.jsonl')
+      const sessionEnvPath = path.join(claudeDir, 'session-env')
 
-    if (!credentials.claudeAiOauth) {
-      return {
-        authenticated: false,
-        error: 'No Claude OAuth credentials found'
-      }
-    }
+      if (fs.existsSync(historyPath) || fs.existsSync(sessionEnvPath)) {
+        const stats = fs.existsSync(historyPath) ? fs.statSync(historyPath) : null
+        const recentlyUsed = stats && (Date.now() - stats.mtimeMs) < 24 * 60 * 60 * 1000
 
-    const { expiresAt, subscriptionType } = credentials.claudeAiOauth
-    const isExpired = new Date(expiresAt) < new Date()
-
-    if (isExpired) {
-      return {
-        authenticated: false,
-        error: `Claude credentials expired at: ${expiresAt}`
+        return {
+          authenticated: true,
+          subscriptionType: null,
+          subscriptionNote: 'For subscription details, run: npx @anthropic-ai/claude-code login',
+          method: 'session detection',
+          lastActivity: stats ? new Date(stats.mtime).toISOString() : 'unknown',
+          recentlyUsed
+        }
       }
     }
 
     return {
-      authenticated: true,
-      subscriptionType,
-      expiresAt
+      authenticated: false,
+      error: 'Claude CLI not logged in. Run: npx @anthropic-ai/claude-code login'
     }
   } catch (error) {
     return {
@@ -103,8 +124,9 @@ function spawnClaudeForConversation(conversationId, systemPrompt, sessionId, isR
     '--output-format', 'stream-json',
     '--input-format', 'stream-json',
     '--replay-user-messages',
-    '--permission-mode', 'plan',
+    '--permission-mode', 'default',
     '--tools', '',
+    '--strict-mcp-config',
     '--settings', JSON.stringify({ disableClaudeMd: true })
   ]
 
@@ -432,7 +454,23 @@ function tryStartServer(ports, index = 0) {
       console.log(`\nAuth Status:`)
       const authStatus = checkClaudeAuth()
       if (authStatus.authenticated) {
-        console.log(`✓ Authenticated (${authStatus.subscriptionType} subscription)`)
+        if (authStatus.subscriptionType) {
+          console.log(`✓ Authenticated (${authStatus.subscriptionType})`)
+        } else {
+          console.log(`✓ Authenticated`)
+        }
+        if (authStatus.method) {
+          console.log(`  Method: ${authStatus.method}`)
+        }
+        if (authStatus.lastActivity) {
+          console.log(`  Last activity: ${authStatus.lastActivity}`)
+        }
+        if (authStatus.expiresAt) {
+          console.log(`  Expires: ${authStatus.expiresAt}`)
+        }
+        if (authStatus.subscriptionNote) {
+          console.log(`  ${authStatus.subscriptionNote}`)
+        }
       } else {
         console.log(`✗ Not authenticated`)
         console.log(`  ${authStatus.error}`)
