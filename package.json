@@ -4,7 +4,7 @@
   "description": "HTTP bridge server for ABsmartly Extension to communicate with Claude Code CLI",
   "main": "index.js",
   "bin": {
-    "claude-code-bridge": "./index.js"
+    "claude-code-bridge": "index.js"
   },
   "scripts": {
     "start": "nodemon --watch index.js --watch package.json --exitcrash index.js"
