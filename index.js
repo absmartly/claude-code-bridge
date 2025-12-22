@@ -6,6 +6,7 @@ const { spawn } = require('child_process')
 const fs = require('fs')
 const path = require('path')
 const os = require('os')
+const { JSDOM } = require('jsdom')
 
 const PREFERRED_PORTS = [3000, 3001, 3002, 3003, 3004]
 const PORT = process.env.PORT ? parseInt(process.env.PORT) : null
@@ -19,6 +20,11 @@ const activeStreams = new Map()
 const conversationMessages = new Map()
 const sessionTracking = new Map()
 const outputBuffers = new Map()
+const conversationHtml = new Map() // Stores HTML for chunk retrieval
+const conversationModels = new Map() // Stores model selection per conversation
+
+// Global JSON schema - set by extension on first conversation
+let globalJsonSchema = null
 
 function checkClaudeAuth() {
   try {
@@ -90,33 +96,58 @@ const DOM_CHANGES_SCHEMA = {
   properties: {
     domChanges: {
       type: 'array',
-      description: 'Array of DOM change instruction objects.'
+      description: 'Array of DOM change objects. Each must have: selector (CSS), type (text|html|style|styleRules|class|attribute|javascript|move|create|delete), and type-specific properties.',
+      items: {
+        type: 'object',
+        properties: {
+          selector: { type: 'string', description: 'CSS selector for target element(s)' },
+          type: {
+            type: 'string',
+            enum: ['text', 'html', 'style', 'styleRules', 'class', 'attribute', 'javascript', 'move', 'create', 'delete'],
+            description: 'Type of DOM change to apply'
+          },
+          value: { description: 'Value for text/html/attribute changes, or CSS object for style changes' },
+          css: { type: 'object', description: 'CSS properties object for style type (alternative to value)' },
+          states: { type: 'object', description: 'CSS states for styleRules type (normal, hover, active, focus)' },
+          add: { type: 'array', items: { type: 'string' }, description: 'Classes to add (for class type)' },
+          remove: { type: 'array', items: { type: 'string' }, description: 'Classes to remove (for class type)' },
+          element: { type: 'string', description: 'HTML to create (for create type)' },
+          targetSelector: { type: 'string', description: 'Target location (for move/create types)' },
+          position: { type: 'string', enum: ['before', 'after', 'firstChild', 'lastChild'], description: 'Position relative to target' },
+          important: { type: 'boolean', description: 'Add !important flag to styles' },
+          waitForElement: { type: 'boolean', description: 'Wait for element to appear (SPA mode)' }
+        },
+        required: ['selector', 'type']
+      }
     },
     response: {
       type: 'string',
-      description: 'Conversational explanation and reasoning.'
+      description: 'Markdown explanation of what you changed and why. No action descriptions (no "I\'ll click..." or "Let me navigate...").'
     },
     action: {
       type: 'string',
       enum: ['append', 'replace_all', 'replace_specific', 'remove_specific', 'none'],
-      description: 'How the DOM changes should be applied.'
+      description: 'How to apply changes: append=add to existing, replace_all=clear all first, replace_specific=replace specific selectors, remove_specific=remove specific selectors, none=no changes'
     },
     targetSelectors: {
       type: 'array',
-      description: 'Selectors to target for replace/remove actions.',
+      description: 'CSS selectors to target when action is replace_specific or remove_specific',
       items: { type: 'string' }
     }
   },
   required: ['domChanges', 'response', 'action']
 }
 
-function spawnClaudeForConversation(conversationId, systemPrompt, sessionId, isResume = false) {
+function spawnClaudeForConversation(conversationId, systemPrompt, sessionId, isResume = false, model = null) {
   if (claudeProcesses.has(conversationId)) {
     console.log(`Claude CLI already running for conversation ${conversationId}`)
     return claudeProcesses.get(conversationId)
   }
 
-  console.log(`Spawning Claude CLI process for conversation ${conversationId}...`)
+  // Get model from stored settings or use default (sonnet)
+  const selectedModel = model || conversationModels.get(conversationId) || 'sonnet'
+  console.log(`Spawning Claude CLI process for conversation ${conversationId} with model: ${selectedModel}...`)
+
   const args = [
     '@anthropic-ai/claude-code',
     '--print',
@@ -125,8 +156,9 @@ function spawnClaudeForConversation(conversationId, systemPrompt, sessionId, isR
     '--input-format', 'stream-json',
     '--replay-user-messages',
     '--permission-mode', 'default',
-    '--tools', '',
+    '--allowedTools', 'Bash(curl:*),Bash(npx:*)',  // Allow curl and npx for chunk retrieval
     '--strict-mcp-config',
+    '--model', selectedModel,  // Use selected model (sonnet, opus, or haiku)
     '--settings', JSON.stringify({ disableClaudeMd: true })
   ]
 
@@ -145,9 +177,10 @@ function spawnClaudeForConversation(conversationId, systemPrompt, sessionId, isR
     args.push('--system-prompt', systemPrompt)
   }
 
-  // Add JSON schema for structured output
-  console.log(`Adding JSON schema for structured DOM changes output`)
-  args.push('--json-schema', JSON.stringify(DOM_CHANGES_SCHEMA))
+  // Add JSON schema for structured output (use global if provided by extension, otherwise fallback)
+  const schemaToUse = globalJsonSchema || DOM_CHANGES_SCHEMA
+  console.log(`Adding JSON schema for structured DOM changes output (source: ${globalJsonSchema ? 'extension' : 'fallback'})`)
+  args.push('--json-schema', JSON.stringify(schemaToUse))
 
   console.log(`[${conversationId}] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`)
   console.log(`[${conversationId}] 🚀 SPAWNING CLAUDE CLI WITH ARGUMENTS:`)
@@ -288,10 +321,30 @@ app.get('/auth/status', (req, res) => {
 })
 
 app.post('/conversations', (req, res) => {
-  const { session_id } = req.body
+  const { session_id, jsonSchema, html, model } = req.body
   const conversationId = session_id || `conv_${Date.now()}`
 
   conversationMessages.set(conversationId, [])
+
+  // Store HTML for chunk retrieval if provided
+  if (html) {
+    conversationHtml.set(conversationId, {
+      html,
+      timestamp: Date.now()
+    })
+    console.log(`📄 Stored HTML for conversation ${conversationId} (${html.length} chars)`)
+  }
+
+  // Store model selection if provided (defaults to sonnet)
+  const selectedModel = model || 'sonnet'
+  conversationModels.set(conversationId, selectedModel)
+  console.log(`🤖 Model for conversation ${conversationId}: ${selectedModel}`)
+
+  // Accept JSON schema from extension if provided (always update to stay in sync)
+  if (jsonSchema) {
+    console.log('📋 Updating JSON schema from extension')
+    globalJsonSchema = jsonSchema
+  }
 
   if (session_id) {
     const isResume = sessionTracking.has(session_id)
@@ -307,7 +360,13 @@ app.post('/conversations', (req, res) => {
 
 app.post('/conversations/:id/messages', (req, res) => {
   const { id } = req.params
-  const { content, files, systemPrompt } = req.body
+  const { content, files, systemPrompt, jsonSchema } = req.body
+
+  // Accept JSON schema if provided (for bridge restarts / schema updates)
+  if (jsonSchema) {
+    console.log('📋 Updating JSON schema from extension (via /messages)')
+    globalJsonSchema = jsonSchema
+  }
 
   if (!claudeProcesses.has(id)) {
     let sessionId = null
@@ -397,6 +456,227 @@ app.get('/conversations/:id/stream', (req, res) => {
   })
 })
 
+// Extract a single HTML chunk by selector using jsdom
+function extractChunk(html, selector, dom = null) {
+  try {
+    // Reuse DOM if provided, otherwise create new one
+    const jsdom = dom || new JSDOM(html)
+    const document = jsdom.window.document
+
+    const element = document.querySelector(selector)
+    if (element) {
+      return { selector, html: element.outerHTML, found: true }
+    }
+
+    return { selector, html: '', found: false, error: `Element not found: ${selector}` }
+  } catch (error) {
+    return { selector, html: '', found: false, error: `Invalid selector: ${error.message}` }
+  }
+}
+
+// Get HTML chunk(s) by CSS selector(s)
+// GET with single selector: ?selector=.hero
+// GET with multiple selectors: ?selectors=.hero,header,#main
+app.get('/conversations/:id/chunk', (req, res) => {
+  const { id } = req.params
+  const { selector, selectors } = req.query
+
+  // Support both single selector and multiple selectors
+  let selectorList = []
+  if (selectors) {
+    selectorList = selectors.split(',').map(s => s.trim()).filter(s => s)
+  } else if (selector) {
+    selectorList = [selector]
+  }
+
+  if (selectorList.length === 0) {
+    return res.status(400).json({ error: 'Missing selector or selectors query parameter' })
+  }
+
+  const stored = conversationHtml.get(id)
+  if (!stored) {
+    return res.status(404).json({ error: 'Conversation not found or no HTML stored' })
+  }
+
+  try {
+    const html = stored.html
+    // Parse DOM once and reuse for all selectors
+    const dom = new JSDOM(html)
+    const results = selectorList.map(sel => extractChunk(html, sel, dom))
+
+    // For single selector (backward compatibility), return single object
+    if (selectorList.length === 1) {
+      const result = results[0]
+      if (!result.found) {
+        return res.status(404).json(result)
+      }
+      return res.json(result)
+    }
+
+    // For multiple selectors, return array
+    return res.json({ results })
+  } catch (error) {
+    return res.status(500).json({ error: `Failed to extract chunk: ${error.message}` })
+  }
+})
+
+// POST endpoint for multiple selectors (preferred for complex requests)
+app.post('/conversations/:id/chunks', (req, res) => {
+  const { id } = req.params
+  const { selectors } = req.body
+
+  if (!selectors || !Array.isArray(selectors) || selectors.length === 0) {
+    return res.status(400).json({ error: 'Missing or invalid selectors array in request body' })
+  }
+
+  const stored = conversationHtml.get(id)
+  if (!stored) {
+    return res.status(404).json({ error: 'Conversation not found or no HTML stored' })
+  }
+
+  try {
+    const html = stored.html
+    // Parse DOM once and reuse for all selectors
+    const dom = new JSDOM(html)
+    const results = selectors.map(sel => extractChunk(html, sel, dom))
+    return res.json({ results })
+  } catch (error) {
+    return res.status(500).json({ error: `Failed to extract chunks: ${error.message}` })
+  }
+})
+
+// Execute XPath query on stored HTML
+function executeXPath(html, xpath, maxResults = 10, dom = null) {
+  try {
+    const jsdom = dom || new JSDOM(html)
+    const document = jsdom.window.document
+    const window = jsdom.window
+
+    // Helper to generate a CSS selector for an element
+    const generateSelector = (element) => {
+      if (element.id) {
+        return `#${element.id}`
+      }
+
+      const tagName = element.tagName.toLowerCase()
+      const classes = Array.from(element.classList || []).filter(c => c && !c.includes(':'))
+
+      if (classes.length > 0) {
+        const classSelector = `${tagName}.${classes.slice(0, 2).join('.')}`
+        if (document.querySelectorAll(classSelector).length === 1) {
+          return classSelector
+        }
+      }
+
+      const parent = element.parentElement
+      if (parent) {
+        const siblings = Array.from(parent.children).filter(c => c.tagName === element.tagName)
+        if (siblings.length > 1) {
+          const index = siblings.indexOf(element) + 1
+          const parentSelector = generateSelector(parent)
+          return `${parentSelector} > ${tagName}:nth-of-type(${index})`
+        }
+        const parentSelector = generateSelector(parent)
+        return `${parentSelector} > ${tagName}`
+      }
+
+      return tagName
+    }
+
+    const matches = []
+    const xpathResult = document.evaluate(
+      xpath,
+      document,
+      null,
+      window.XPathResult.ORDERED_NODE_SNAPSHOT_TYPE,
+      null
+    )
+
+    for (let i = 0; i < Math.min(xpathResult.snapshotLength, maxResults); i++) {
+      const node = xpathResult.snapshotItem(i)
+      if (!node) continue
+
+      if (node.nodeType === window.Node.ELEMENT_NODE) {
+        matches.push({
+          selector: generateSelector(node),
+          html: node.outerHTML.slice(0, 2000),
+          textContent: (node.textContent || '').slice(0, 200),
+          nodeType: 'element'
+        })
+      } else if (node.nodeType === window.Node.TEXT_NODE) {
+        const parentElement = node.parentElement
+        if (parentElement) {
+          matches.push({
+            selector: generateSelector(parentElement),
+            html: parentElement.outerHTML.slice(0, 2000),
+            textContent: (node.textContent || '').slice(0, 200),
+            nodeType: 'text'
+          })
+        }
+      } else if (node.nodeType === window.Node.ATTRIBUTE_NODE) {
+        matches.push({
+          selector: '',
+          html: `${node.name}="${node.value}"`,
+          textContent: node.value,
+          nodeType: 'attribute'
+        })
+      }
+    }
+
+    return { xpath, matches, found: matches.length > 0 }
+  } catch (error) {
+    return { xpath, matches: [], found: false, error: `XPath error: ${error.message}` }
+  }
+}
+
+// XPath query endpoint
+app.post('/conversations/:id/xpath', (req, res) => {
+  const { id } = req.params
+  const { xpath, maxResults = 10 } = req.body
+
+  if (!xpath) {
+    return res.status(400).json({ error: 'Missing xpath in request body' })
+  }
+
+  const stored = conversationHtml.get(id)
+  if (!stored) {
+    return res.status(404).json({ error: 'Conversation not found or no HTML stored' })
+  }
+
+  try {
+    const result = executeXPath(stored.html, xpath, maxResults)
+    if (!result.found && result.error) {
+      return res.status(400).json(result)
+    }
+    return res.json(result)
+  } catch (error) {
+    return res.status(500).json({ error: `Failed to execute XPath: ${error.message}` })
+  }
+})
+
+// Refresh stored HTML for a conversation
+app.post('/conversations/:id/refresh', (req, res) => {
+  const { id } = req.params
+  const { html } = req.body
+
+  if (!html) {
+    return res.status(400).json({ error: 'Missing html in request body' })
+  }
+
+  const existing = conversationHtml.get(id)
+  if (!existing) {
+    return res.status(404).json({ error: 'Conversation not found' })
+  }
+
+  conversationHtml.set(id, {
+    html,
+    timestamp: Date.now()
+  })
+
+  console.log(`🔄 Refreshed HTML for conversation ${id} (${html.length} chars)`)
+  res.json({ success: true })
+})
+
 app.post('/conversations/:id/approve', (req, res) => {
   const { id } = req.params
   const { requestId, data } = req.body
@@ -482,6 +762,8 @@ function tryStartServer(ports, index = 0) {
       console.log(`  POST /conversations`)
       console.log(`  POST /conversations/:id/messages`)
       console.log(`  GET  /conversations/:id/stream`)
+      console.log(`  GET  /conversations/:id/chunk     (HTML chunk retrieval)`)
+      console.log(`  POST /conversations/:id/refresh   (Update stored HTML)`)
       console.log(`  POST /conversations/:id/approve`)
       console.log(`  POST /conversations/:id/deny`)
       console.log(`\nReady for connections from ABsmartly extension 🚀\n`)
