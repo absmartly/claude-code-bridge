@@ -10,6 +10,7 @@ const { JSDOM } = require('jsdom')
 
 const PREFERRED_PORTS = [3000, 3001, 3002, 3003, 3004]
 const PORT = process.env.PORT ? parseInt(process.env.PORT) : null
+const MAX_LOG_LENGTH = 3000 // ~one page of text
 
 const app = express()
 app.use(cors())
@@ -25,6 +26,50 @@ const conversationModels = new Map() // Stores model selection per conversation
 
 // Global JSON schema - set by extension on first conversation
 let globalJsonSchema = null
+
+function truncateForLog(data, maxLength = MAX_LOG_LENGTH) {
+  let output
+
+  if (typeof data === 'string') {
+    output = data
+  } else if (typeof data === 'object') {
+    output = JSON.stringify(data, null, 2)
+  } else {
+    output = String(data)
+  }
+
+  if (output.length <= maxLength) {
+    return output
+  }
+
+  const truncated = output.substring(0, maxLength)
+  const remaining = output.length - maxLength
+  const linesRemaining = (output.substring(maxLength).match(/\n/g) || []).length
+
+  return `${truncated}\n\n... [truncated ${remaining} characters, ~${linesRemaining} more lines]`
+}
+
+function truncateToolUseResponses(event, maxLength = MAX_LOG_LENGTH) {
+  // Deep clone the event to avoid mutating the original
+  const cloned = JSON.parse(JSON.stringify(event))
+
+  // Check if event has result.toolUses array
+  if (cloned.result && Array.isArray(cloned.result.toolUses)) {
+    cloned.result.toolUses = cloned.result.toolUses.map(toolUse => {
+      if (toolUse.response && typeof toolUse.response === 'string' && toolUse.response.length > maxLength) {
+        const truncated = toolUse.response.substring(0, maxLength)
+        const remaining = toolUse.response.length - maxLength
+        return {
+          ...toolUse,
+          response: `${truncated}\n\n... [truncated ${remaining} characters]`
+        }
+      }
+      return toolUse
+    })
+  }
+
+  return cloned
+}
 
 function checkClaudeAuth() {
   try {
@@ -207,7 +252,8 @@ function spawnClaudeForConversation(conversationId, systemPrompt, sessionId, isR
         const event = JSON.parse(line)
         console.log(`[${conversationId}] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`)
         console.log(`[${conversationId}] 📦 RAW EVENT FROM CLAUDE CLI:`)
-        console.log(JSON.stringify(event, null, 2))
+        const truncatedEvent = truncateToolUseResponses(event)
+        console.log(truncateForLog(truncatedEvent))
         console.log(`[${conversationId}] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`)
 
         const res = activeStreams.get(conversationId)
@@ -223,7 +269,7 @@ function spawnClaudeForConversation(conversationId, systemPrompt, sessionId, isR
                   // Check if it matches our schema (has required fields)
                   if (parsedJson.domChanges && parsedJson.response && parsedJson.action) {
                     console.log(`[${conversationId}] ✅ Parsed JSON schema response, forwarding as structured data`)
-                    console.log(`[${conversationId}] Structured data:`, JSON.stringify(parsedJson, null, 2))
+                    console.log(`[${conversationId}] Structured data:`, truncateForLog(parsedJson))
                     // Send as tool_use-style event for compatibility
                     res.write(`data: ${JSON.stringify({ type: 'tool_use', data: parsedJson })}\n\n`)
                     // Also send the response text for display
@@ -241,7 +287,7 @@ function spawnClaudeForConversation(conversationId, systemPrompt, sessionId, isR
               } else if (block.type === 'tool_use' && block.input) {
                 // Handle tool_use blocks (shouldn't happen with --json-schema, but keep for safety)
                 console.log(`[${conversationId}] ✅ Found tool_use block, forwarding to client`)
-                console.log(`[${conversationId}] Tool input:`, JSON.stringify(block.input, null, 2))
+                console.log(`[${conversationId}] Tool input:`, truncateForLog(block.input))
                 const toolInput = block.input
                 res.write(`data: ${JSON.stringify({ type: 'tool_use', data: toolInput })}\n\n`)
                 if (toolInput.response) {

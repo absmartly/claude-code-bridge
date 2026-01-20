@@ -3,3 +3,4 @@ package-lock.json
 .playwright-mcp/
 *.log
 .DS_Store
+.claude/
